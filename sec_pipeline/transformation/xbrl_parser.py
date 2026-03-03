@@ -1,9 +1,12 @@
+import asyncio
 import logging
 import re
 import html
 from typing import Any, Dict, List
 from arelle import Cntlr, XbrlConst
 from arelle.ModelXbrl import ModelXbrl
+
+from sec_pipeline.transformation.parse_logger import ParseLogger, Severity, NULL_PARSE_LOGGER
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +71,10 @@ class XBRLParserService:
         Returns:
             Dict containing all extracted XBRL data in JSON format
         """
+        return await asyncio.to_thread(self._sync_parse, url)
+
+    def _sync_parse(self, url: str) -> Dict[str, Any]:
+        """Synchronous parse body — runs in a thread pool via to_thread."""
         model_xbrl = None
         try:
             logger.info(f"Loading XBRL document from: {url}")
@@ -106,34 +113,41 @@ class XBRLParserService:
             model_xbrl: Loaded Arelle ModelXbrl instance
 
         Returns:
-            Dict containing all facts, contexts, units, taxonomy metadata, and relationships
+            Dict containing all facts, contexts, units, taxonomy metadata, and relationships.
+            Individual sections that fail are returned as empty lists/dicts with
+            errors recorded in parse_log so downstream consumers get partial results.
         """
-        result = {
-            # Document metadata
-            "document_info": self._extract_document_info(model_xbrl),
+        parse_log = ParseLogger()
 
-            # Instance data (the actual reported values)
-            "contexts": self._extract_contexts(model_xbrl),
-            "units": self._extract_units(model_xbrl),
-            "facts": self._extract_facts(model_xbrl),
-
-            # Taxonomy metadata (structure and definitions)
-            "concepts": self._extract_concepts(model_xbrl),
-            "labels": self._extract_labels(model_xbrl),
-            "role_definitions": self._extract_role_definitions(model_xbrl),
-
-            # Relationship linkbases (how things connect)
-            "presentation_relationships": self._extract_presentation_relationships(model_xbrl),
-            "calculation_relationships": self._extract_calculation_relationships(model_xbrl),
-            "definition_relationships": self._extract_definition_relationships(model_xbrl),
-
-            # Summary statistics
-            "summary": self._generate_summary(model_xbrl)
+        sections: Dict[str, Any] = {
+            "document_info": (self._extract_document_info, {}),
+            "contexts": (self._extract_contexts, []),
+            "units": (self._extract_units, []),
+            "facts": (self._extract_facts, []),
+            "concepts": (self._extract_concepts, []),
+            "labels": (self._extract_labels, []),
+            "role_definitions": (self._extract_role_definitions, []),
+            "presentation_relationships": (self._extract_presentation_relationships, []),
+            "calculation_relationships": (self._extract_calculation_relationships, []),
+            "definition_relationships": (self._extract_definition_relationships, []),
+            "summary": (self._generate_summary, {}),
         }
+
+        result: Dict[str, Any] = {}
+
+        for section_name, (extractor, fallback) in sections.items():
+            try:
+                result[section_name] = extractor(model_xbrl, parse_log=parse_log)
+            except Exception as e:
+                logger.error(f"Section {section_name!r} failed: {type(e).__name__}: {e}")
+                parse_log.log_error(section_name, e, detail=f"Entire {section_name} section failed")
+                result[section_name] = fallback
+
+        result["parse_log"] = parse_log.to_dict()
 
         return result
 
-    def _extract_document_info(self, model_xbrl: ModelXbrl) -> Dict[str, Any]:
+    def _extract_document_info(self, model_xbrl: ModelXbrl, *, parse_log: ParseLogger = NULL_PARSE_LOGGER) -> Dict[str, Any]:
         """Extract document-level metadata."""
         doc_info = {
             "document_type": model_xbrl.modelDocument.type if model_xbrl.modelDocument else None,
@@ -141,99 +155,117 @@ class XBRLParserService:
         }
 
         # Get entity identifier from the first context if available
-        if model_xbrl.contexts:
-            first_context = next(iter(model_xbrl.contexts.values()))
-            if hasattr(first_context, 'entityIdentifier'):
-                doc_info["entity"] = {
-                    "identifier": first_context.entityIdentifier[1],  # [0] is scheme, [1] is identifier
-                    "scheme": first_context.entityIdentifier[0]
-                }
+        try:
+            if model_xbrl.contexts:
+                first_context = next(iter(model_xbrl.contexts.values()))
+                if hasattr(first_context, 'entityIdentifier'):
+                    doc_info["entity"] = {
+                        "identifier": first_context.entityIdentifier[1],  # [0] is scheme, [1] is identifier
+                        "scheme": first_context.entityIdentifier[0]
+                    }
+        except Exception as e:
+            parse_log.log_error("document_info", e, field="entity")
 
         return doc_info
 
-    def _extract_contexts(self, model_xbrl: ModelXbrl) -> List[Dict[str, Any]]:
+    def _extract_contexts(self, model_xbrl: ModelXbrl, *, parse_log: ParseLogger = NULL_PARSE_LOGGER) -> List[Dict[str, Any]]:
         """Extract all contexts from the XBRL instance."""
         contexts = []
 
         for context_id, context in model_xbrl.contexts.items():
-            context_data = {
-                "id": context_id,
-                "entity": {
-                    "identifier": context.entityIdentifier[1],
-                    "scheme": context.entityIdentifier[0]
-                },
-                "period": {}
-            }
+            try:
+                context_data = {
+                    "id": context_id,
+                    "entity": {
+                        "identifier": context.entityIdentifier[1],
+                        "scheme": context.entityIdentifier[0]
+                    },
+                    "period": {}
+                }
 
-            # Extract period information
-            if context.isInstantPeriod:
-                context_data["period"]["type"] = "instant"
-                context_data["period"]["instant"] = str(context.instantDatetime) if context.instantDatetime else None
-            elif context.isStartEndPeriod:
-                context_data["period"]["type"] = "duration"
-                context_data["period"]["start_date"] = str(context.startDatetime) if context.startDatetime else None
-                context_data["period"]["end_date"] = str(context.endDatetime) if context.endDatetime else None
-            elif context.isForeverPeriod:
-                context_data["period"]["type"] = "forever"
+                # Extract period information
+                if context.isInstantPeriod:
+                    context_data["period"]["type"] = "instant"
+                    context_data["period"]["instant"] = str(context.instantDatetime) if context.instantDatetime else None
+                elif context.isStartEndPeriod:
+                    context_data["period"]["type"] = "duration"
+                    context_data["period"]["start_date"] = str(context.startDatetime) if context.startDatetime else None
+                    context_data["period"]["end_date"] = str(context.endDatetime) if context.endDatetime else None
+                elif context.isForeverPeriod:
+                    context_data["period"]["type"] = "forever"
 
-            # Extract dimensions (explicit and typed members)
-            dimensions = []
-            if hasattr(context, 'qnameDims') and context.qnameDims:
-                for dim_qname, dim_value in context.qnameDims.items():
-                    dim_data = {
-                        "dimension": str(dim_qname),
-                        "type": "explicit" if hasattr(dim_value, 'memberQname') else "typed"
-                    }
-                    if hasattr(dim_value, 'memberQname'):
-                        dim_data["value"] = str(dim_value.memberQname)
-                    elif hasattr(dim_value, 'typedMember'):
-                        dim_data["value"] = str(dim_value.typedMember.stringValue) if hasattr(dim_value.typedMember, 'stringValue') else str(dim_value.typedMember)
-                    dimensions.append(dim_data)
+                # Extract dimensions (explicit and typed members)
+                dimensions = []
+                if hasattr(context, 'qnameDims') and context.qnameDims:
+                    for dim_qname, dim_value in context.qnameDims.items():
+                        dim_data = {
+                            "dimension": str(dim_qname),
+                            "type": "explicit" if hasattr(dim_value, 'memberQname') else "typed"
+                        }
+                        if hasattr(dim_value, 'memberQname'):
+                            dim_data["value"] = str(dim_value.memberQname)
+                        elif hasattr(dim_value, 'typedMember'):
+                            dim_data["value"] = str(dim_value.typedMember.stringValue) if hasattr(dim_value.typedMember, 'stringValue') else str(dim_value.typedMember)
+                        dimensions.append(dim_data)
 
-            if dimensions:
-                context_data["dimensions"] = dimensions
+                if dimensions:
+                    context_data["dimensions"] = dimensions
 
-            contexts.append(context_data)
+                contexts.append(context_data)
 
+            except Exception as e:
+                logger.debug(f"Error extracting context {context_id}: {e}")
+                parse_log.log_error("contexts", e, context_ref=context_id)
+                continue
+
+        parse_log.record_section_count("contexts", len(contexts))
         return contexts
 
-    def _extract_units(self, model_xbrl: ModelXbrl) -> List[Dict[str, Any]]:
+    def _extract_units(self, model_xbrl: ModelXbrl, *, parse_log: ParseLogger = NULL_PARSE_LOGGER) -> List[Dict[str, Any]]:
         """Extract all units from the XBRL instance."""
         units = []
 
         for unit_id, unit in model_xbrl.units.items():
-            unit_data = {
-                "id": unit_id,
-                "measures": []
-            }
+            try:
+                unit_data = {
+                    "id": unit_id,
+                    "measures": []
+                }
 
-            # Handle simple and divide units
-            # Arelle always returns a 2-tuple: (numerator_measures, denominator_measures)
-            # Simple units have an empty denominator tuple, e.g. ((iso4217:USD,), ())
-            # Divide units have both populated, e.g. ((iso4217:USD,), (shares,))
-            if hasattr(unit, 'measures'):
-                if len(unit.measures) == 2 and unit.measures[1]:
-                    # Divide unit (e.g., USD/share) — denominator is non-empty
-                    unit_data["numerator"] = [str(m) for m in unit.measures[0]]
-                    unit_data["denominator"] = [str(m) for m in unit.measures[1]]
-                    unit_data["unit_type"] = "divide"
-                    unit_data["numerator_measure"] = str(unit.measures[0][0]) if unit.measures[0] else None
-                    unit_data["denominator_measure"] = str(unit.measures[1][0]) if unit.measures[1] else None
-                    del unit_data["measures"]
-                else:
-                    # Simple unit — either 1-tuple or 2-tuple with empty denominator
-                    numerator = unit.measures[0] if unit.measures else ()
-                    unit_data["measures"] = [str(m) for m in numerator]
-                    unit_data["unit_type"] = "simple"
-                    unit_data["measure"] = str(numerator[0]) if numerator else None
+                # Handle simple and divide units
+                # Arelle always returns a 2-tuple: (numerator_measures, denominator_measures)
+                # Simple units have an empty denominator tuple, e.g. ((iso4217:USD,), ())
+                # Divide units have both populated, e.g. ((iso4217:USD,), (shares,))
+                if hasattr(unit, 'measures'):
+                    if len(unit.measures) == 2 and unit.measures[1]:
+                        # Divide unit (e.g., USD/share) — denominator is non-empty
+                        unit_data["numerator"] = [str(m) for m in unit.measures[0]]
+                        unit_data["denominator"] = [str(m) for m in unit.measures[1]]
+                        unit_data["unit_type"] = "divide"
+                        unit_data["numerator_measure"] = str(unit.measures[0][0]) if unit.measures[0] else None
+                        unit_data["denominator_measure"] = str(unit.measures[1][0]) if unit.measures[1] else None
+                        del unit_data["measures"]
+                    else:
+                        # Simple unit — either 1-tuple or 2-tuple with empty denominator
+                        numerator = unit.measures[0] if unit.measures else ()
+                        unit_data["measures"] = [str(m) for m in numerator]
+                        unit_data["unit_type"] = "simple"
+                        unit_data["measure"] = str(numerator[0]) if numerator else None
 
-            units.append(unit_data)
+                units.append(unit_data)
 
+            except Exception as e:
+                logger.debug(f"Error extracting unit {unit_id}: {e}")
+                parse_log.log_error("units", e, detail=unit_id)
+                continue
+
+        parse_log.record_section_count("units", len(units))
         return units
 
-    def _extract_facts(self, model_xbrl: ModelXbrl) -> List[Dict[str, Any]]:
+    def _extract_facts(self, model_xbrl: ModelXbrl, *, parse_log: ParseLogger = NULL_PARSE_LOGGER) -> List[Dict[str, Any]]:
         """Extract all facts from the XBRL instance."""
         facts = []
+        validation_counts: dict[tuple, int] = {}
 
         for fact in model_xbrl.facts:
             raw_value = fact.value
@@ -303,15 +335,24 @@ class XBRLParserService:
                                         member_label = dim_value.member.label(lang="en-US")
                                         if member_label:
                                             dim_data["member_label"] = member_label
-                                    except Exception:
-                                        pass
+                                    except Exception as e:
+                                        parse_log.log_info(
+                                            "facts", e,
+                                            concept=str(fact.qname),
+                                            context_ref=fact.contextID,
+                                            field="dimension_member_label",
+                                        )
                             elif hasattr(dim_value, 'typedMember'):
                                 dim_data["value"] = str(dim_value.typedMember.stringValue) if hasattr(dim_value.typedMember, 'stringValue') else str(dim_value.typedMember)
 
                             dimensions.append(dim_data)
-                        except Exception:
-                            # Skip dimensions that cause errors
-                            pass
+                        except Exception as e:
+                            parse_log.log_error(
+                                "facts", e,
+                                concept=str(fact.qname),
+                                context_ref=fact.contextID,
+                                field="dimension",
+                            )
 
                 if dimensions:
                     fact_data["dimensions"] = dimensions
@@ -331,9 +372,13 @@ class XBRLParserService:
                     if terse_label and terse_label != standard_label:
                         # Decode HTML entities in labels
                         fact_data["terse_label"] = html.unescape(terse_label)
-                except Exception:
-                    # Label extraction failed, skip it
-                    pass
+                except Exception as e:
+                    parse_log.log_warning(
+                        "facts", e,
+                        concept=str(fact.qname),
+                        context_ref=fact.contextID,
+                        field="label",
+                    )
 
             # Add numeric flag directly from Arelle
             fact_data["is_numeric"] = fact.isNumeric
@@ -348,8 +393,13 @@ class XBRLParserService:
                 try:
                     if fact.concept.type is not None and hasattr(fact.concept.type, 'qname'):
                         fact_data["data_type"] = str(fact.concept.type.qname)
-                except Exception:
-                    pass
+                except Exception as e:
+                    parse_log.log_warning(
+                        "facts", e,
+                        concept=str(fact.qname),
+                        context_ref=fact.contextID,
+                        field="data_type",
+                    )
 
             # Add iXBRL source tracing information (for Inline XBRL files)
             # This allows linking back to the exact location in the SEC filing
@@ -364,33 +414,151 @@ class XBRLParserService:
                 if hasattr(fact, 'modelDocument') and fact.modelDocument is not None:
                     if hasattr(fact.modelDocument, 'basename'):
                         fact_data["source_file"] = fact.modelDocument.basename
-            except Exception:
-                # If iXBRL source extraction fails, continue without it
-                pass
+            except Exception as e:
+                parse_log.log_info(
+                    "facts", e,
+                    concept=str(fact.qname),
+                    context_ref=fact.contextID,
+                    field="ixbrl_source",
+                )
 
+            self._validate_fact_data(fact, fact_data, parse_log, validation_counts)
             facts.append(fact_data)
 
+        # Flush aggregated validation counts
+        for (severity, message, field), count in validation_counts.items():
+            parse_log.log_aggregate(
+                severity, "facts", f"{count} facts: {message}",
+                count=count, field=field,
+            )
+
+        parse_log.record_section_count("facts", len(facts))
         return facts
 
-    def _generate_summary(self, model_xbrl: ModelXbrl) -> Dict[str, Any]:
-        """Generate summary statistics about the XBRL document."""
+    def _validate_fact_data(
+        self,
+        fact: Any,
+        fact_data: Dict[str, Any],
+        parse_log: ParseLogger,
+        validation_counts: dict[tuple, int],
+    ) -> None:
+        """Run proactive validation checks on a fact before it is appended.
+
+        Purely observational — does not modify fact_data.
+        ERROR checks are logged per-fact (rare, need detail).
+        WARNING/INFO checks are aggregated into validation_counts and flushed
+        by the caller after the fact loop.
+        """
+        concept = fact_data.get("concept", "unknown")
+        context_ref = fact_data.get("context_ref")
+        is_numeric = fact_data.get("is_numeric", False)
+        is_nil = fact_data.get("is_nil", False)
+        value = fact_data.get("value")
+
+        # ── ERROR checks (data integrity compromised — per-fact detail) ──
+
+        if is_numeric and not is_nil:
+            if value is None or value == "":
+                parse_log.log_error(
+                    "facts",
+                    "Numeric non-nil fact has no value",
+                    concept=concept,
+                    context_ref=context_ref,
+                    field="value",
+                )
+            elif isinstance(value, str):
+                try:
+                    float(value.replace(",", ""))
+                except (ValueError, TypeError):
+                    parse_log.log_error(
+                        "facts",
+                        f"Numeric value not parseable as float: {value!r}",
+                        concept=concept,
+                        context_ref=context_ref,
+                        field="value",
+                    )
+
+        period = fact_data.get("period")
+        if period is not None and period == {}:
+            parse_log.log_error(
+                "facts",
+                "Context present but period is indeterminate (empty)",
+                concept=concept,
+                context_ref=context_ref,
+                field="period",
+            )
+
+        # ── WARNING checks (usable but degraded — aggregated) ──
+
+        if fact.context is None:
+            key = (Severity.WARNING, "Fact has no context (no period, entity, or dimensions)", "context")
+            validation_counts[key] = validation_counts.get(key, 0) + 1
+
+        if is_numeric and not is_nil:
+            if fact_data.get("unit_ref") is None:
+                key = (Severity.WARNING, "Numeric fact missing unit_ref", "unit_ref")
+                validation_counts[key] = validation_counts.get(key, 0) + 1
+            if fact_data.get("decimals") is None and fact_data.get("precision") is None:
+                key = (Severity.WARNING, "Numeric fact missing both decimals and precision", "decimals")
+                validation_counts[key] = validation_counts.get(key, 0) + 1
+
+        if period is not None:
+            ptype = period.get("type")
+            if ptype == "instant" and period.get("instant") is None:
+                key = (Severity.WARNING, "Instant period with no date", "period")
+                validation_counts[key] = validation_counts.get(key, 0) + 1
+            elif ptype == "duration" and (period.get("start_date") is None or period.get("end_date") is None):
+                key = (Severity.WARNING, "Duration period with missing start or end date", "period")
+                validation_counts[key] = validation_counts.get(key, 0) + 1
+
+        if fact.context is not None and fact_data.get("entity_identifier") is None:
+            key = (Severity.WARNING, "Context present but no entity_identifier", "entity_identifier")
+            validation_counts[key] = validation_counts.get(key, 0) + 1
+
+        if not is_numeric and not is_nil and value == "":
+            key = (Severity.WARNING, "Non-numeric, non-nil fact with empty string value", "value")
+            validation_counts[key] = validation_counts.get(key, 0) + 1
+
+        # ── INFO checks (enrichment gaps — aggregated) ──
+
+        if fact_data.get("label") is None:
+            key = (Severity.INFO, "No standard label resolved", "label")
+            validation_counts[key] = validation_counts.get(key, 0) + 1
+
+        if (
+            fact_data.get("html_anchor_id") is None
+            and fact_data.get("source_line") is None
+            and fact_data.get("source_file") is None
+        ):
+            key = (Severity.INFO, "No iXBRL source info (anchor, line, file all missing)", "ixbrl_source")
+            validation_counts[key] = validation_counts.get(key, 0) + 1
+
+    def _generate_summary(self, model_xbrl: ModelXbrl, *, parse_log: ParseLogger = NULL_PARSE_LOGGER) -> Dict[str, Any]:
+        """Generate summary statistics about the XBRL document.
+
+        Uses actual extracted counts from parse_log when available, falling
+        back to raw Arelle model counts for the null logger path.
+        """
         # Extract unique namespaces from facts
         namespaces = set()
         for fact in model_xbrl.facts:
-            if fact.qname.namespaceURI:
-                # Get the prefix for this namespace
-                prefix = fact.qname.prefix
-                if prefix:
-                    namespaces.add(prefix)
+            try:
+                if fact.qname.namespaceURI:
+                    prefix = fact.qname.prefix
+                    if prefix:
+                        namespaces.add(prefix)
+            except Exception:
+                continue
 
+        counts = getattr(parse_log, '_section_counts', {})
         return {
-            "total_facts": len(model_xbrl.facts),
-            "total_contexts": len(model_xbrl.contexts),
-            "total_units": len(model_xbrl.units),
+            "total_facts": counts.get("facts", len(model_xbrl.facts)),
+            "total_contexts": counts.get("contexts", len(model_xbrl.contexts)),
+            "total_units": counts.get("units", len(model_xbrl.units)),
             "namespaces": sorted(list(namespaces))
         }
 
-    def _extract_concepts(self, model_xbrl: ModelXbrl) -> List[Dict[str, Any]]:
+    def _extract_concepts(self, model_xbrl: ModelXbrl, *, parse_log: ParseLogger = NULL_PARSE_LOGGER) -> List[Dict[str, Any]]:
         """
         Extract all concepts from the taxonomy.
 
@@ -439,59 +607,61 @@ class XBRLParserService:
                     standard_label = concept.label(lang="en-US")
                     if standard_label:
                         concept_data["standard_label"] = html.unescape(standard_label)
-                except Exception:
-                    pass
+                except Exception as e:
+                    parse_log.log_warning("concepts", e, concept=str(qname), field="standard_label")
 
                 try:
                     terse_label = concept.label(preferredLabel=XbrlConst.terseLabel, lang="en-US")
                     if terse_label:
                         concept_data["terse_label"] = html.unescape(terse_label)
-                except Exception:
-                    pass
+                except Exception as e:
+                    parse_log.log_warning("concepts", e, concept=str(qname), field="terse_label")
 
                 try:
                     verbose_label = concept.label(preferredLabel=XbrlConst.verboseLabel, lang="en-US")
                     if verbose_label:
                         concept_data["verbose_label"] = html.unescape(verbose_label)
-                except Exception:
-                    pass
+                except Exception as e:
+                    parse_log.log_warning("concepts", e, concept=str(qname), field="verbose_label")
 
                 try:
                     documentation = concept.label(preferredLabel=XbrlConst.documentationLabel, lang="en-US")
                     if documentation:
                         concept_data["documentation"] = html.unescape(documentation)
-                except Exception:
-                    pass
+                except Exception as e:
+                    parse_log.log_warning("concepts", e, concept=str(qname), field="documentation")
 
                 # Extract type information
                 try:
                     if hasattr(concept, 'typeQname') and concept.typeQname:
                         concept_data["data_type"] = str(concept.typeQname)
-                except Exception:
-                    pass
+                except Exception as e:
+                    parse_log.log_warning("concepts", e, concept=str(qname), field="data_type")
 
                 try:
                     if hasattr(concept, 'baseXsdType') and concept.baseXsdType:
                         concept_data["base_xsd_type"] = concept.baseXsdType
-                except Exception:
-                    pass
+                except Exception as e:
+                    parse_log.log_info("concepts", e, concept=str(qname), field="base_xsd_type")
 
                 try:
                     if hasattr(concept, 'substitutionGroupQname') and concept.substitutionGroupQname:
                         concept_data["substitution_group"] = str(concept.substitutionGroupQname)
-                except Exception:
-                    pass
+                except Exception as e:
+                    parse_log.log_info("concepts", e, concept=str(qname), field="substitution_group")
 
                 concepts.append(concept_data)
 
             except Exception as e:
-                logger.warning(f"Error extracting concept {qname}: {e}")
+                logger.debug(f"Error extracting concept {qname}: {e}")
+                parse_log.log_error("concepts", e, concept=str(qname))
                 continue
 
         logger.info(f"Successfully extracted {len(concepts)} concepts")
+        parse_log.record_section_count("concepts", len(concepts))
         return concepts
 
-    def _extract_labels(self, model_xbrl: ModelXbrl) -> List[Dict[str, Any]]:
+    def _extract_labels(self, model_xbrl: ModelXbrl, *, parse_log: ParseLogger = NULL_PARSE_LOGGER) -> List[Dict[str, Any]]:
         """
         Extract all labels from the label linkbase.
 
@@ -505,21 +675,27 @@ class XBRLParserService:
         labels = []
 
         for qname, concept in model_xbrl.qnameConcepts.items():
-            for rel in label_rel_set.fromModelObject(concept):
-                label_resource = rel.toModelObject
-                if label_resource is None or not label_resource.text:
-                    continue
-                labels.append({
-                    "concept_qname": str(qname),
-                    "label_role": label_resource.role,
-                    "label_text": strip_html(label_resource.text),
-                    "language": label_resource.xmlLang or "en-US",
-                })
+            try:
+                for rel in label_rel_set.fromModelObject(concept):
+                    label_resource = rel.toModelObject
+                    if label_resource is None or not label_resource.text:
+                        continue
+                    labels.append({
+                        "concept_qname": str(qname),
+                        "label_role": label_resource.role,
+                        "label_text": strip_html(label_resource.text),
+                        "language": label_resource.xmlLang or "en-US",
+                    })
+            except Exception as e:
+                logger.debug(f"Error extracting labels for concept {qname}: {e}")
+                parse_log.log_warning("labels", e, concept=str(qname))
+                continue
 
         logger.info(f"Extracted {len(labels)} labels from label linkbase")
+        parse_log.record_section_count("labels", len(labels))
         return labels
 
-    def _extract_role_definitions(self, model_xbrl: ModelXbrl) -> List[Dict[str, Any]]:
+    def _extract_role_definitions(self, model_xbrl: ModelXbrl, *, parse_log: ParseLogger = NULL_PARSE_LOGGER) -> List[Dict[str, Any]]:
         """
         Extract all active role definitions from the presentation linkbase.
 
@@ -559,13 +735,15 @@ class XBRLParserService:
                 role_definitions.append(role_data)
 
             except Exception as e:
-                logger.warning(f"Error extracting role definition {role_uri}: {e}")
+                logger.debug(f"Error extracting role definition {role_uri}: {e}")
+                parse_log.log_warning("role_definitions", e, detail=role_uri)
                 continue
 
         logger.info(f"Successfully extracted {len(role_definitions)} role definitions")
+        parse_log.record_section_count("role_definitions", len(role_definitions))
         return role_definitions
 
-    def _extract_presentation_relationships(self, model_xbrl: ModelXbrl) -> List[Dict[str, Any]]:
+    def _extract_presentation_relationships(self, model_xbrl: ModelXbrl, *, parse_log: ParseLogger = NULL_PARSE_LOGGER) -> List[Dict[str, Any]]:
         """
         Extract presentation relationships (hierarchy) from the presentation linkbase.
 
@@ -597,13 +775,15 @@ class XBRLParserService:
                     "priority": rel.priority if hasattr(rel, 'priority') else None,
                 })
             except Exception as e:
-                logger.warning(f"Error extracting presentation relationship: {e}")
+                logger.debug(f"Error extracting presentation relationship: {e}")
+                parse_log.log_error("presentation_relationships", e)
                 continue
 
         logger.info(f"Successfully extracted {len(relationships)} presentation relationships")
+        parse_log.record_section_count("presentation_relationships", len(relationships))
         return relationships
 
-    def _extract_calculation_relationships(self, model_xbrl: ModelXbrl) -> List[Dict[str, Any]]:
+    def _extract_calculation_relationships(self, model_xbrl: ModelXbrl, *, parse_log: ParseLogger = NULL_PARSE_LOGGER) -> List[Dict[str, Any]]:
         """
         Extract calculation relationships from the calculation linkbase.
 
@@ -640,10 +820,12 @@ class XBRLParserService:
                 calculations.append(calc_data)
 
             except Exception as e:
-                logger.warning(f"Error extracting calculation relationship: {e}")
+                logger.debug(f"Error extracting calculation relationship: {e}")
+                parse_log.log_error("calculation_relationships", e)
                 continue
 
         logger.info(f"Successfully extracted {len(calculations)} calculation relationships")
+        parse_log.record_section_count("calculation_relationships", len(calculations))
         return calculations
 
     def _traverse_domain_member_tree(
@@ -696,7 +878,7 @@ class XBRLParserService:
 
         return results
 
-    def _extract_definition_relationships(self, model_xbrl: ModelXbrl) -> List[Dict[str, Any]]:
+    def _extract_definition_relationships(self, model_xbrl: ModelXbrl, *, parse_log: ParseLogger = NULL_PARSE_LOGGER) -> List[Dict[str, Any]]:
         """
         Extract definition relationships from the definition linkbase.
 
@@ -738,7 +920,8 @@ class XBRLParserService:
                         rel_data["is_closed"] = str(rel.closed) if rel.closed else None
                     relationships.append(rel_data)
                 except Exception as e:
-                    logger.warning(f"Error extracting definition relationship ({type_name}): {e}")
+                    logger.debug(f"Error extracting definition relationship ({type_name}): {e}")
+                    parse_log.log_warning("definition_relationships", e, field=type_name)
                     continue
 
         # Domain-member arcrole (hierarchical, needs tree traversal)
@@ -759,31 +942,18 @@ class XBRLParserService:
                         )
                     )
             except Exception as e:
-                logger.warning(f"Error traversing domain-member tree from {root.qname}: {e}")
+                logger.debug(f"Error traversing domain-member tree from {root.qname}: {e}")
+                parse_log.log_warning(
+                    "definition_relationships", e,
+                    concept=str(root.qname),
+                    field="domain-member",
+                )
                 continue
 
         logger.info(
             f"Successfully extracted {len(relationships)} definition relationships "
             f"(domain-member source: {dm_total} raw rels)"
         )
+        parse_log.record_section_count("definition_relationships", len(relationships))
         return relationships
 
-
-_xbrl_parser_service: XBRLParserService | None = None
-
-
-def get_xbrl_parser_service(**kwargs) -> XBRLParserService:
-    """Get or create the XBRL parser service singleton."""
-    global _xbrl_parser_service
-    if _xbrl_parser_service is None:
-        _xbrl_parser_service = XBRLParserService(**kwargs)
-    return _xbrl_parser_service
-
-
-class _LazyParser:
-    """Proxy that defers XBRLParserService construction until first use."""
-    def __getattr__(self, name):
-        return getattr(get_xbrl_parser_service(), name)
-
-
-xbrl_parser_service = _LazyParser()

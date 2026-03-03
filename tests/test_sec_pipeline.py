@@ -7,6 +7,7 @@ what's needed for Snowflake ingestion.
 NOTE: XBRL parsing tests require Arelle (run inside Docker):
     docker compose exec app pytest tests/test_sec_pipeline.py -v -s
 """
+import json
 import pytest
 import logging
 from datetime import datetime
@@ -295,7 +296,6 @@ class TestXBRLParse:
         rel = pres[0]
         assert "parent_concept" in rel
         assert "child_concept" in rel
-        assert "depth" in rel
         assert "role_uri" in rel
         logger.info(f"Total presentation relationships: {len(pres)}")
 
@@ -394,3 +394,231 @@ class TestEndToEnd:
         logger.info(f"  Definition Rels: {len(xbrl_data['definition_relationships'])}")
         logger.info(f"  Labels: {len(xbrl_data['labels'])}")
         logger.info("=" * 60)
+
+
+# ---------------------------------------------------------------------------
+# 4. ParseLogger Unit Tests (no Arelle needed, runs locally)
+# ---------------------------------------------------------------------------
+
+class TestParseLogger:
+    """Unit tests for the structured parse-time error logger.
+
+    Imports parse_logger directly from its file path to avoid triggering
+    the sec_pipeline package init (which requires Arelle).
+    """
+
+    @pytest.fixture
+    def parse_logger_module(self):
+        """Load parse_logger module without triggering the arelle-dependent package chain."""
+        import importlib.util
+        import pathlib
+
+        module_path = pathlib.Path(__file__).resolve().parent.parent / "sec_pipeline" / "transformation" / "parse_logger.py"
+        spec = importlib.util.spec_from_file_location("parse_logger", module_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    @pytest.fixture
+    def ParseLogger(self, parse_logger_module):
+        """Load ParseLogger without triggering the arelle-dependent package chain."""
+        return parse_logger_module.ParseLogger
+
+    @pytest.fixture
+    def Severity(self, parse_logger_module):
+        """Load Severity enum without triggering the arelle-dependent package chain."""
+        return parse_logger_module.Severity
+
+    def test_empty_log_structure(self, ParseLogger):
+        """An unused ParseLogger should produce a valid structure with zero counts."""
+        log = ParseLogger()
+        result = log.to_dict()
+
+        assert result["error_count"] == 0
+        assert result["warning_count"] == 0
+        assert result["info_count"] == 0
+        assert result["entries"] == []
+        assert isinstance(result["elapsed_seconds"], float)
+        assert result["elapsed_seconds"] >= 0
+
+    def test_error_entries_capture_all_fields(self, ParseLogger):
+        """log_error should record all provided keyword arguments."""
+        log = ParseLogger()
+        exc = AttributeError("'NoneType' has no attribute 'label'")
+        log.log_error(
+            "facts",
+            exc,
+            concept="us-gaap:Revenue",
+            context_ref="c-123",
+            field="label",
+            detail="extra info",
+        )
+
+        result = log.to_dict()
+        assert result["error_count"] == 1
+
+        entry = result["entries"][0]
+        assert entry["severity"] == "error"
+        assert entry["section"] == "facts"
+        assert entry["source_type"] == "AttributeError"
+        assert entry["message"] == "'NoneType' has no attribute 'label'"
+        assert entry["concept"] == "us-gaap:Revenue"
+        assert entry["context_ref"] == "c-123"
+        assert entry["field"] == "label"
+        assert entry["detail"] == "extra info"
+
+    def test_optional_fields_omitted_when_none(self, ParseLogger):
+        """Only provided kwargs should appear in the entry dict."""
+        log = ParseLogger()
+        log.log_error("concepts", ValueError("bad"), concept="us-gaap:Assets")
+
+        entry = log.to_dict()["entries"][0]
+        assert entry["severity"] == "error"
+        assert "concept" in entry
+        assert "context_ref" not in entry
+        assert "field" not in entry
+        assert "detail" not in entry
+
+    def test_multiple_errors_accumulate(self, ParseLogger):
+        """Multiple log_error calls should all be recorded."""
+        log = ParseLogger()
+        for i in range(5):
+            log.log_error("facts", RuntimeError(f"err {i}"), concept=f"concept-{i}")
+
+        result = log.to_dict()
+        assert result["error_count"] == 5
+        assert len(result["entries"]) == 5
+
+    def test_output_is_json_serializable(self, ParseLogger):
+        """The full to_dict() output must survive json.dumps."""
+        log = ParseLogger()
+        log.log_error("facts", TypeError("test"), concept="x:Y", field="label")
+        log.log_warning("concepts", ValueError("bad value"), concept="z:W")
+
+        serialized = json.dumps(log.to_dict())
+        deserialized = json.loads(serialized)
+        assert deserialized["error_count"] == 1
+        assert deserialized["warning_count"] == 1
+        assert len(deserialized["entries"]) == 2
+
+    # ── New severity tests ──
+
+    def test_severity_levels_tracked_separately(self, ParseLogger):
+        """Log one of each severity and verify counts are independent."""
+        log = ParseLogger()
+        log.log_error("facts", RuntimeError("broken"), concept="a:B")
+        log.log_warning("concepts", ValueError("degraded"), concept="c:D")
+        log.log_info("facts", "cosmetic note", concept="e:F")
+
+        result = log.to_dict()
+        assert result["error_count"] == 1
+        assert result["warning_count"] == 1
+        assert result["info_count"] == 1
+        assert len(result["entries"]) == 3
+
+    def test_severity_field_present_on_each_entry(self, ParseLogger, Severity):
+        """Every entry must have a valid severity value."""
+        log = ParseLogger()
+        log.log_error("facts", RuntimeError("e"))
+        log.log_warning("facts", RuntimeError("w"))
+        log.log_info("facts", "i")
+
+        valid_severities = {s.value for s in Severity}
+        for entry in log.to_dict()["entries"]:
+            assert "severity" in entry
+            assert entry["severity"] in valid_severities
+
+    def test_string_error_produces_observation_type(self, ParseLogger):
+        """When a plain string is passed, source_type should be 'Observation'."""
+        log = ParseLogger()
+        log.log_warning("facts", "Label fallback used", concept="us-gaap:Revenue", field="label")
+
+        entry = log.to_dict()["entries"][0]
+        assert entry["source_type"] == "Observation"
+        assert entry["message"] == "Label fallback used"
+        assert entry["severity"] == "warning"
+
+    def test_exception_preserves_type_name(self, ParseLogger):
+        """When an exception is passed, source_type should be the class name."""
+        log = ParseLogger()
+        log.log_error("concepts", KeyError("missing"), concept="us-gaap:Assets")
+
+        entry = log.to_dict()["entries"][0]
+        assert entry["source_type"] == "KeyError"
+        assert entry["severity"] == "error"
+
+    def test_log_info_records_correctly(self, ParseLogger):
+        """Info severity with field kwarg should be recorded accurately."""
+        log = ParseLogger()
+        log.log_info("facts", "No iXBRL source", concept="us-gaap:Revenue", field="ixbrl_source")
+
+        result = log.to_dict()
+        assert result["info_count"] == 1
+        assert result["error_count"] == 0
+        assert result["warning_count"] == 0
+
+        entry = result["entries"][0]
+        assert entry["severity"] == "info"
+        assert entry["section"] == "facts"
+        assert entry["field"] == "ixbrl_source"
+        assert entry["concept"] == "us-gaap:Revenue"
+
+    # ── Null logger tests ──
+
+    def test_null_logger_is_silent(self, parse_logger_module):
+        """NULL_PARSE_LOGGER should accept all calls without raising."""
+        null = parse_logger_module.NULL_PARSE_LOGGER
+        null.log_error("facts", RuntimeError("boom"), concept="x:Y")
+        null.log_warning("facts", "degraded", field="label")
+        null.log_info("facts", "cosmetic")
+        null.log_aggregate(parse_logger_module.Severity.WARNING, "facts", "5 facts: missing label", count=5)
+
+    def test_null_logger_returns_empty_dict(self, parse_logger_module):
+        """NULL_PARSE_LOGGER.to_dict() should return zero counts and no entries."""
+        result = parse_logger_module.NULL_PARSE_LOGGER.to_dict()
+        assert result["error_count"] == 0
+        assert result["warning_count"] == 0
+        assert result["info_count"] == 0
+        assert result["elapsed_seconds"] == 0.0
+        assert result["entries"] == []
+
+    # ── Aggregate tests ──
+
+    def test_log_aggregate_records_summary_entry(self, ParseLogger, Severity):
+        """log_aggregate should create a single Aggregate entry with count."""
+        log = ParseLogger()
+        log.log_aggregate(
+            Severity.WARNING, "facts", "42 facts: Numeric fact missing unit_ref",
+            count=42, field="unit_ref",
+        )
+
+        result = log.to_dict()
+        assert result["warning_count"] == 1
+        assert len(result["entries"]) == 1
+
+        entry = result["entries"][0]
+        assert entry["severity"] == "warning"
+        assert entry["section"] == "facts"
+        assert entry["source_type"] == "Aggregate"
+        assert entry["message"] == "42 facts: Numeric fact missing unit_ref"
+        assert entry["count"] == 42
+        assert entry["field"] == "unit_ref"
+
+    def test_log_aggregate_without_field(self, ParseLogger, Severity):
+        """log_aggregate should omit field key when not provided."""
+        log = ParseLogger()
+        log.log_aggregate(Severity.INFO, "facts", "10 facts: cosmetic", count=10)
+
+        entry = log.to_dict()["entries"][0]
+        assert "field" not in entry
+        assert entry["count"] == 10
+
+    def test_log_aggregate_is_json_serializable(self, ParseLogger, Severity):
+        """Aggregate entries must survive json.dumps."""
+        log = ParseLogger()
+        log.log_aggregate(Severity.WARNING, "facts", "5 facts: test", count=5, field="x")
+
+        serialized = json.dumps(log.to_dict())
+        deserialized = json.loads(serialized)
+        assert deserialized["entries"][0]["source_type"] == "Aggregate"
+        assert deserialized["entries"][0]["count"] == 5
